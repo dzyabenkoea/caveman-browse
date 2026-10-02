@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/JuliusBrussee/caveman/engine"
+	"github.com/JuliusBrussee/caveman/engine/compressors"
 	"github.com/JuliusBrussee/caveman/engine/tokens"
 	"github.com/JuliusBrussee/caveman/mcp"
 )
@@ -180,7 +181,7 @@ func (s *Session) snapshotTool(args json.RawMessage) mcp.ToolResult {
 			"snapshot did not compress to a uid view; raw tree withheld and prior uids retained")
 	}
 	h := res.RecoveryHandle
-	targets, err := s.targetsForHandle(h)
+	targets, err := s.targetsForView(h, raw, a.Query, res.Output)
 	if err != nil {
 		s.log.Warn("a11y uid metadata unavailable", "err", err)
 		return mcp.ToolError("cave_browser_snapshot_failed", "snapshot uid map unavailable; prior uids retained")
@@ -216,11 +217,48 @@ func snapshotTimeout(wait time.Duration) time.Duration {
 	return base
 }
 
-func (s *Session) targetsForHandle(handle string) (map[string]Target, error) {
-	meta, err := s.eng.RetrieveMetadata(handle)
+// targetsForView returns the uid→Target map for exactly the uids shown in
+// view, the compressor output of this snapshot.
+//
+// CCR metadata alone is not enough: the recovery handle is a content hash of
+// the raw AX tree, so re-snapshotting an unchanged page with a different query
+// reuses the handle, and the store keeps the metadata written by the FIRST
+// query (Store.Put skips unchanged recoveries and never overwrites non-empty
+// metadata). That map lacks uids only the new query shows. The stored map is
+// used when it covers every shown uid — the common case, at no extra cost —
+// otherwise this snapshot's map is recomputed by re-running the a11y
+// compressor on the same raw+query (uid assignment is a pure function of the
+// raw tree, so it agrees with the view). Either way the result is narrowed to
+// the shown uids, so a stale superset never leaks hidden targets.
+func (s *Session) targetsForView(handle string, raw []byte, query string, view []byte) (map[string]Target, error) {
+	shown := shownUIDs(view)
+	if meta, err := s.eng.RetrieveMetadata(handle); err == nil {
+		if stored, err := decodeUIDMetadata(meta); err == nil {
+			if targets, ok := pickShownTargets(stored, shown); ok {
+				return targets, nil
+			}
+		}
+	}
+	mc, ok := compressors.NewAXTree().(compressors.MetadataCompressor)
+	if !ok {
+		return nil, errors.New("a11y compressor does not report uid metadata")
+	}
+	_, meta, ok := mc.CompressWithMetadata(raw, query)
+	if !ok {
+		return nil, errors.New("a11y uid metadata recompute failed")
+	}
+	fresh, err := decodeUIDMetadata(meta.RecoveryMetadata)
 	if err != nil {
 		return nil, err
 	}
+	targets, ok := pickShownTargets(fresh, shown)
+	if !ok {
+		return nil, errors.New("a11y uid metadata does not cover the snapshot view")
+	}
+	return targets, nil
+}
+
+func decodeUIDMetadata(meta []byte) (map[string]Target, error) {
 	if len(meta) == 0 {
 		return nil, errors.New("empty a11y recovery metadata")
 	}
@@ -234,6 +272,37 @@ func (s *Session) targetsForHandle(handle string) (map[string]Target, error) {
 		decoded.UIDs = map[string]Target{}
 	}
 	return decoded.UIDs, nil
+}
+
+// shownUIDs lists the uids the compact view exposes. renderAXRecords puts a
+// uid only at line start after the indent, and accessible names are
+// strconv.Quote'd (no raw newlines), so a "[...]" inside a name never matches.
+func shownUIDs(view []byte) []string {
+	var out []string
+	for _, line := range strings.Split(string(view), "\n") {
+		rest := strings.TrimLeft(line, " ")
+		if !strings.HasPrefix(rest, "[") {
+			continue
+		}
+		if end := strings.Index(rest, "] "); end > 1 {
+			out = append(out, rest[1:end])
+		}
+	}
+	return out
+}
+
+// pickShownTargets narrows all to the shown uids; ok is false when any shown
+// uid has no target.
+func pickShownTargets(all map[string]Target, shown []string) (map[string]Target, bool) {
+	out := make(map[string]Target, len(shown))
+	for _, uid := range shown {
+		target, ok := all[uid]
+		if !ok {
+			return nil, false
+		}
+		out[uid] = target
+	}
+	return out, true
 }
 
 // renderSnapshot writes the agent-visible payload: the compact AX view plus one

@@ -314,6 +314,47 @@ func TestSnapshotQueryFocusesOutputAndTargetCache(t *testing.T) {
 	}
 }
 
+// TestResnapshotUnchangedPageWithNewQueryMapsNewlyShownUIDs is the stale-CCR
+// metadata regression: the recovery handle is a content hash of the raw AX
+// tree, so an unchanged page re-snapshotted with a different query reuses the
+// handle, and the CCR store keeps the FIRST query's uid metadata. Before the fix
+// a uid shown only by the second query was missing from the target cache and
+// browser_act failed with cave_unknown_uid.
+func TestResnapshotUnchangedPageWithNewQueryMapsNewlyShownUIDs(t *testing.T) {
+	s, driver := testSession(t)
+	first := parseSnapshot(t, s.snapshotTool(jsonArgs(t, map[string]any{"url": "http://local", "query": "save settings"})))
+	if strings.Contains(first.UIDs, "[uf]") {
+		t.Fatalf("fixture precondition: first query must not show the link uid:\n%s", first.UIDs)
+	}
+	if _, ok := s.lookupTarget("uf"); ok {
+		t.Fatal("fixture precondition: link uid cached by first query")
+	}
+
+	tr := s.snapshotTool(jsonArgs(t, map[string]any{"query": "trace detail"}))
+	if tr.IsError {
+		t.Fatalf("second snapshot failed: %s", tr.Content[0].Text)
+	}
+	second := parseSnapshot(t, tr)
+	if *second.RecoveryHandle != *first.RecoveryHandle {
+		t.Fatalf("fixture precondition: unchanged raw tree must reuse the handle, got %s vs %s",
+			*first.RecoveryHandle, *second.RecoveryHandle)
+	}
+	if !strings.Contains(second.UIDs, `[uf] link "View trace detail"`) {
+		t.Fatalf("second query did not show the link uid:\n%s", second.UIDs)
+	}
+	act := s.actTool(jsonArgs(t, map[string]any{"uid": "uf", "action": "click"}))
+	if act.IsError {
+		t.Fatalf("act on uid shown by the latest snapshot failed: %s", act.Content[0].Text)
+	}
+	if driver.lastTgt.BackendDOMNodeID != 15 {
+		t.Fatalf("act dispatched to wrong target: %+v", driver.lastTgt)
+	}
+	// The cache tracks the latest view: a uid only the first query showed is gone.
+	if _, ok := s.lookupTarget("ua"); ok && !strings.Contains(second.UIDs, "[ua]") {
+		t.Fatalf("target cache kept a uid the latest view does not show: %+v", s.TargetsSnapshot())
+	}
+}
+
 // TestSnapshotPayloadIsTextNotJSON locks the 12.5% escaping tax out. Wrapping
 // the view in JSON escaped every strconv.Quote'd accessible name a second time.
 func TestSnapshotPayloadIsTextNotJSON(t *testing.T) {

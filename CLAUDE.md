@@ -69,6 +69,12 @@ recover the byte-exact original AX payload through CCR. Every saving here is
   it MUST NEVER dump the raw AX tree into `uids` (strictly worse than not using
   Browse) nor wipe the target cache. Regressing this reopens a
   known acting-dead failure mode.
+- **CCR uid metadata can be stale for the same handle.** The handle hashes the
+  raw AX tree only, and `Store.Put` keeps the first-written metadata, so an
+  unchanged page re-snapshotted with another `query` gets the old query's uids.
+  `targetsForView` uses the stored map only when it covers every uid in the view,
+  else re-runs the `a11y` compressor on raw+query; the cache is always narrowed to
+  the shown uids.
 - **An `<iframe>` is a leaf, not a broken tree.** `Accessibility.getFullAXTree`
   returns one frame at a time, so an iframe node's `childId` points at a child
   document absent from this payload; the `a11y` compressor
