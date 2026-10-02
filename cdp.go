@@ -8,6 +8,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/chromedp/cdproto/accessibility"
@@ -30,6 +31,10 @@ type CDPOptions struct {
 }
 
 type CDPDriver struct {
+	mu          sync.Mutex
+	parent      context.Context
+	opts        CDPOptions
+	closed      bool
 	allocCtx    context.Context
 	allocCancel context.CancelFunc
 	ctx         context.Context
@@ -41,6 +46,17 @@ func NewCDPDriver(parent context.Context, opts CDPOptions) (*CDPDriver, error) {
 	if parent == nil {
 		parent = context.Background()
 	}
+	d := &CDPDriver{parent: parent, opts: opts}
+	if err := d.connect(opts); err != nil {
+		return nil, err
+	}
+	return d, nil
+}
+
+// connect opens the allocator and page context. Callers hold d.mu or own d
+// exclusively (constructor).
+func (d *CDPDriver) connect(opts CDPOptions) error {
+	parent := d.parent
 	var allocCtx context.Context
 	var allocCancel context.CancelFunc
 	var tmpProfile string
@@ -51,7 +67,7 @@ func NewCDPDriver(parent context.Context, opts CDPOptions) (*CDPDriver, error) {
 		if userDataDir == "" {
 			dir, err := os.MkdirTemp("", "caveman-browse-*")
 			if err != nil {
-				return nil, err
+				return err
 			}
 			tmpProfile = dir
 			userDataDir = dir
@@ -86,12 +102,66 @@ func NewCDPDriver(parent context.Context, opts CDPOptions) (*CDPDriver, error) {
 		if tmpProfile != "" {
 			_ = os.RemoveAll(tmpProfile)
 		}
-		return nil, fmt.Errorf("start browser: %w", err)
+		return fmt.Errorf("start browser: %w", err)
 	}
-	return &CDPDriver{allocCtx: allocCtx, allocCancel: allocCancel, ctx: ctx, cancel: cancel, tmpProfile: tmpProfile}, nil
+	d.allocCtx, d.allocCancel, d.ctx, d.cancel = allocCtx, allocCancel, ctx, cancel
+	if tmpProfile != "" {
+		d.tmpProfile = tmpProfile
+	}
+	return nil
+}
+
+// alive reports whether the browser behind d.ctx still answers. When Chrome
+// dies chromedp cancels d.ctx; the probe also catches a socket that is open
+// but no longer served.
+func (d *CDPDriver) alive() bool {
+	if d.ctx == nil || d.ctx.Err() != nil {
+		return false
+	}
+	probeCtx, cancel := context.WithTimeout(d.ctx, 2*time.Second)
+	defer cancel()
+	return chromedp.Run(probeCtx, chromedp.ActionFunc(func(actionCtx context.Context) error {
+		_, _, _, _, _, err := cdpbrowser.GetVersion().Do(actionCtx)
+		return err
+	})) == nil
+}
+
+// ensure reconnects a long-lived driver whose browser went away. A shared
+// Chrome (CAVEMAN_BROWSE_CDP) may be restarted on the same endpoint while the
+// MCP server keeps running; before this every later call failed with
+// "context canceled" until the server itself was restarted. The old target
+// is gone with its browser, so the new context opens a fresh tab and earlier
+// uids fail closed until the next snapshot.
+func (d *CDPDriver) ensure() error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.closed {
+		return errors.New("browser driver closed")
+	}
+	if d.alive() {
+		return nil
+	}
+	if d.cancel != nil {
+		d.cancel()
+	}
+	if d.allocCancel != nil {
+		d.allocCancel()
+	}
+	opts := d.opts
+	opts.TargetID = ""
+	if d.tmpProfile != "" {
+		opts.UserDataDir = d.tmpProfile
+	}
+	if err := d.connect(opts); err != nil {
+		return fmt.Errorf("reconnect browser: %w", err)
+	}
+	return nil
 }
 
 func (d *CDPDriver) Close() error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.closed = true
 	if d.cancel != nil {
 		d.cancel()
 	}
@@ -137,6 +207,9 @@ func (d *CDPDriver) Snapshot(ctx context.Context, url string, wait time.Duration
 	if wait < 0 {
 		wait = 0
 	}
+	if err := d.ensure(); err != nil {
+		return nil, err
+	}
 	runCtx, cancel := d.requestContext(ctx)
 	defer cancel()
 	var nodes []*accessibility.Node
@@ -178,6 +251,9 @@ func dedupAXNodes(nodes []*accessibility.Node) []*accessibility.Node {
 }
 
 func (d *CDPDriver) Act(ctx context.Context, req ActionRequest, target Target) (ActionResult, error) {
+	if err := d.ensure(); err != nil {
+		return ActionResult{OK: false, Settled: false}, err
+	}
 	runCtx, cancel := d.requestContext(ctx)
 	defer cancel()
 	// A headful Chrome whose window lacks OS focus (attached via
@@ -271,6 +347,9 @@ func (d *CDPDriver) Shutdown(ctx context.Context) error {
 }
 
 func (d *CDPDriver) Eval(ctx context.Context, expression string) (any, error) {
+	if err := d.ensure(); err != nil {
+		return nil, err
+	}
 	runCtx, cancel := d.requestContext(ctx)
 	defer cancel()
 	var result any

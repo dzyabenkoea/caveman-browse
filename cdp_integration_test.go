@@ -5,8 +5,11 @@ package browse
 import (
 	"bytes"
 	"context"
+	"net"
+	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 	"testing"
@@ -257,4 +260,87 @@ func urlEscape(s string) string {
 		"#", "%23", "\n", "",
 	)
 	return replacer.Replace(s)
+}
+
+// TestCDPReconnectsAfterAttachedBrowserRestart covers the long-lived MCP server
+// attached to a shared Chrome (CAVEMAN_BROWSE_CDP): when that Chrome dies and
+// comes back on the same endpoint, the next call must work without restarting
+// the server.
+func TestCDPReconnectsAfterAttachedBrowserRestart(t *testing.T) {
+	chrome := os.Getenv("CAVEMAN_BROWSE_CHROME")
+	if chrome == "" {
+		t.Skip("CAVEMAN_BROWSE_CHROME not set")
+	}
+	port := freePort(t)
+	endpoint := "http://127.0.0.1:" + strconv.Itoa(port)
+	profile := t.TempDir()
+	start := func() *exec.Cmd {
+		cmd := exec.Command(chrome, "--headless=new", "--remote-debugging-port="+strconv.Itoa(port),
+			"--user-data-dir="+profile, "--no-first-run", "--no-default-browser-check", "about:blank")
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+		waitEndpoint(t, endpoint)
+		return cmd
+	}
+	stop := func(cmd *exec.Cmd) {
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
+	}
+
+	first := start()
+	driver, err := NewCDPDriver(context.Background(), CDPOptions{Endpoint: endpoint})
+	if err != nil {
+		stop(first)
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = driver.Close() })
+	page := `data:text/html,` + urlEscape(`<main><h1>Reconnect probe</h1></main>`)
+	if _, err := driver.Snapshot(context.Background(), page, 0); err != nil {
+		stop(first)
+		t.Fatalf("snapshot before restart: %v", err)
+	}
+
+	stop(first)
+	second := start()
+	t.Cleanup(func() { stop(second) })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	raw, err := driver.Snapshot(ctx, page, 0)
+	if err != nil {
+		t.Fatalf("snapshot after restart: %v", err)
+	}
+	if !bytes.Contains(raw, []byte("Reconnect probe")) {
+		t.Fatalf("snapshot after restart misses page content: %s", raw)
+	}
+	if got, err := driver.Eval(ctx, `1 + 1`); err != nil || got != float64(2) {
+		t.Fatalf("eval after restart: got=%v err=%v", got, err)
+	}
+}
+
+func freePort(t *testing.T) int {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	return l.Addr().(*net.TCPAddr).Port
+}
+
+func waitEndpoint(t *testing.T, endpoint string) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		resp, err := http.Get(endpoint + "/json/version")
+		if err == nil {
+			resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				return
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatalf("chrome endpoint %s did not come up", endpoint)
 }
